@@ -4,9 +4,9 @@
 
 ```bash
 uv sync
-uvx ruff check
-uvx ruff format
-uvx pyright
+uvx ruff check .
+uvx ruff format .
+uvx pyright .
 ```
 
 ## PR Instructions

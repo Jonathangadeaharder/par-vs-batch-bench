@@ -12,6 +12,8 @@ Compares pure generation throughput (excludes model loading time):
 
 ```bash
 uv run bench.py --help
+# Example:
+uv run bench.py --model <path_to_mlx_model>
 ```
 
 ## Requirements
