@@ -19,7 +19,7 @@ checksum: 769ff7d75d94c1a8f4c27501b9257562545eb3e915fe1ed170216802087656b8
 
 ## Executive Summary
 
-A single-purpose 383-line Python benchmarking script comparing sequential vs batched vs parallel MLX inference on Apple Silicon. Key finding: sequential generate() at 43.8 tok/s decisively outperforms both batched and parallel (~22 tok/s) on a 64GB machine. No tests, no packaging, CI limited to SonarCloud scan, documentation includes README, 5 ADRs, and design spec. Acceptable as a research artifact -- would need full rework for production reuse. Recommendation: add hardware context to JSON output and archive unless reuse is planned.
+A single-purpose 383-line Python benchmarking script comparing sequential vs batched vs parallel MLX inference on Apple Silicon. Key finding: sequential generate() at 43.8 tok/s decisively outperforms both batched and parallel (~22 tok/s) on a 64GB machine. No tests, no packaging, CI limited to SonarCloud scan, documentation includes README and 2 ADRs. Acceptable as a research artifact -- would need full rework for production reuse. Recommendation: add hardware context to JSON output and archive unless reuse is planned.
 
 ## Scope
 
@@ -59,12 +59,12 @@ mlx and mlx-lm loaded at runtime without pinned versions -- results not reproduc
 |------|-----------|--------|------------|
 | Results not reproducible (unpinned deps) | High | Medium | Add pyproject.toml with pinned versions if reuse planned |
 | No hardware context in results.json | High | Low | Add machine specs (chip, RAM, OS, mlx version) to results |
-| No documentation or README | Low | Low | README.md and ADRs exist; methodology documented |
+| Documentation is minimal | Low | Low | README.md and ADRs exist; methodology documented |
 | Dead code in batch_generate() | Medium | Low | Clean up commented-out approaches if reusing |
 | No cross-validation of results | Medium | Low | Document as single-run findings |
 
 ## Recommendations
 
 1. Add machine specs (Apple Silicon model, RAM, OS version, mlx version) to results.json immediately (P1).
-2. If reuse is planned: add pyproject.toml with pinned deps, README with methodology, clean up dead code (P2).
+2. If reuse is planned: add pyproject.toml with pinned deps, expand hardware/result reproducibility details, clean up dead code (P2).
 3. If not reusable: archive the repository with results.json as permanent research record (P2).
