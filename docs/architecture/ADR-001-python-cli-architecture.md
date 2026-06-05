@@ -10,7 +10,7 @@
 - Positive: Zero package overhead — single file to understand and modify
 - Positive: Fast iteration cycle (edit and run, no build step)
 - Negative: Poor discoverability for reusable modules
-- Negative: No formal dependency declaration beyond uv.lock
+- Negative: No formal dependency declaration (no pyproject.toml or requirements.txt)
 
 **Alternatives:**
 - Rust CLI: Faster execution but harder to iterate on ML experiments

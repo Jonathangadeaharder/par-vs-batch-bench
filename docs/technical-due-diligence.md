@@ -19,11 +19,11 @@ checksum: 769ff7d75d94c1a8f4c27501b9257562545eb3e915fe1ed170216802087656b8
 
 ## Executive Summary
 
-A single-purpose 383-line Python benchmarking script comparing sequential vs batched vs parallel MLX inference on Apple Silicon. Key finding: sequential generate() at 43.8 tok/s decisively outperforms both batched and parallel (~22 tok/s) on a 64GB machine. No tests, no packaging, no CI/CD, no documentation beyond the script docstring. Acceptable as a research artifact -- would need full rework for production reuse. Recommendation: add hardware context to results.json and archive unless reuse is planned.
+A single-purpose 383-line Python benchmarking script comparing sequential vs batched vs parallel MLX inference on Apple Silicon. Key finding: sequential generate() at 43.8 tok/s decisively outperforms both batched and parallel (~22 tok/s) on a 64GB machine. No tests, no packaging, CI limited to SonarCloud scan, documentation includes README and 2 ADRs. Acceptable as a research artifact -- would need full rework for production reuse. Recommendation: add hardware context to JSON output and archive unless reuse is planned.
 
 ## Scope
 
-Assessed: single bench.py script (383 lines), results.json (64 lines), empty docs/ directories. Excluded: dependency management, CI/CD, testing, packaging, cross-platform support, cross-validation of results.
+Assessed: single bench.py script (383 lines). Excluded: dependency management, CI/CD beyond SonarCloud, testing, packaging, cross-platform support, cross-validation of results.
 
 ## Architecture
 
@@ -47,7 +47,7 @@ Script answers its research question definitively: sequential wins at 43.8 tok/s
 
 ## Operations & DevOps
 
-No CI/CD. No packaging. No release process. No version control discipline beyond the .git directory. No environment reproducibility. Must be run from repo root with mlx pre-installed.
+No tests or packaging. CI limited to SonarCloud scan (.github/workflows/sonarcloud.yml). No environment reproducibility. Must be run from repo root with mlx pre-installed.
 
 ## Dependencies & Third-Party Risk
 
@@ -59,12 +59,12 @@ mlx and mlx-lm loaded at runtime without pinned versions -- results not reproduc
 |------|-----------|--------|------------|
 | Results not reproducible (unpinned deps) | High | Medium | Add pyproject.toml with pinned versions if reuse planned |
 | No hardware context in results.json | High | Low | Add machine specs (chip, RAM, OS, mlx version) to results |
-| No documentation or README | High | Low | Add docstring or brief README with methodology |
+| Documentation is minimal | Low | Low | README.md and ADRs exist; methodology documented |
 | Dead code in batch_generate() | Medium | Low | Clean up commented-out approaches if reusing |
 | No cross-validation of results | Medium | Low | Document as single-run findings |
 
 ## Recommendations
 
 1. Add machine specs (Apple Silicon model, RAM, OS version, mlx version) to results.json immediately (P1).
-2. If reuse is planned: add pyproject.toml with pinned deps, README with methodology, clean up dead code (P2).
+2. If reuse is planned: add pyproject.toml with pinned deps, expand hardware/result reproducibility details, clean up dead code (P2).
 3. If not reusable: archive the repository with results.json as permanent research record (P2).

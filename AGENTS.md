@@ -3,7 +3,7 @@
 ## Build & Test Commands
 
 ```bash
-uv sync
+# No pyproject.toml — skip uv sync. Dependencies loaded at runtime by mlx/mlx-lm.
 uvx ruff check .
 uvx ruff format .
 uvx pyright .

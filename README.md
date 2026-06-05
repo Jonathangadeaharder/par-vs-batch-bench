@@ -20,3 +20,5 @@ uv run bench.py --model <path_to_mlx_model>
 
 - macOS with Apple Silicon
 - `uv` package manager
+- `mlx` (core framework)
+- `mlx-lm` (model loading and generation)

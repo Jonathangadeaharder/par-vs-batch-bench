@@ -4,7 +4,7 @@
 
 **Context:** Benchmark results must be human-readable in the terminal and optionally machine-readable for tracking over time. The comparison table should clearly show speedup factors.
 
-**Decision:** Output a formatted table with columns: Mode, Parameter (batch size / worker count), Tokens/sec, Speedup, and Latency. Results are also written to a JSON file (`results.json`) when `--output` is specified. Speedup is always relative to sequential baseline.
+**Decision:** Output a formatted table with columns: Mode, Parameter (batch size / worker count), Tokens/sec, Speedup, and Latency. Results are optionally written to a JSON file when `--output <path>` is specified (no file output by default). Speedup is always relative to sequential baseline.
 
 **Consequences:**
 - Positive: Terminal output is immediately readable
