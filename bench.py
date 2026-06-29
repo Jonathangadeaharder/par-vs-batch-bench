@@ -29,6 +29,7 @@ import gc
 import json
 import multiprocessing as mp
 import os
+import queue
 import subprocess
 import time
 from pathlib import Path
@@ -46,10 +47,11 @@ MEDIUM_PROMPT = (
 
 def get_ram_gb() -> float:
     try:
-        r = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True)
+        r = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.memsize"],
+                           capture_output=True, text=True, check=True)
         return int(r.stdout.strip()) / (1024**3)
-    except Exception:
-        return 0.0
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return 0.0  # non-macOS or sysctl missing; caller treats 0 as "unknown"
 
 
 def make_prompts(n: int, text: str = MEDIUM_PROMPT) -> list[str]:
@@ -62,6 +64,8 @@ def make_prompts(n: int, text: str = MEDIUM_PROMPT) -> list[str]:
 # ---------------------------------------------------------------------------
 def gen_batch(model, tokenizer, ids: list[list[int]], max_tokens: int) -> tuple[int, float]:
     eos_id = tokenizer.eos_token_id
+    if eos_id is None and getattr(tokenizer, "eos_token", None) is not None:
+        eos_id = tokenizer.convert_tokens_to_ids(tokenizer.eos_token)
     B = len(ids)
     # ponytail: prompts are duplicated (all equal length), so no attention mask
     # is needed for the batched prefill. Differing lengths would need left-pad +
@@ -80,7 +84,7 @@ def gen_batch(model, tokenizer, ids: list[list[int]], max_tokens: int) -> tuple[
 
     finished = [False] * B
     total = 0
-    for _ in range(max_tokens):
+    for step in range(max_tokens):
         toks = next_tok.tolist()
         active = False
         for i in range(B):
@@ -91,8 +95,8 @@ def gen_batch(model, tokenizer, ids: list[list[int]], max_tokens: int) -> tuple[
             else:
                 total += 1
                 active = True
-        if not active:
-            break
+        if not active or step == max_tokens - 1:
+            break  # last token counted; don't decode an extra unused one (skews timing)
         logits = model(next_tok.reshape(B, 1), cache=cache)
         next_tok = mx.argmax(logits[:, -1, :], axis=-1)
         mx.eval(next_tok)
@@ -169,44 +173,64 @@ def bench_batched(handle: ModelHandle, n: int, bs: int, max_tokens: int, repeats
     return run_inproc("batched", bs, lambda: handle.batched(make_prompts(n), bs, max_tokens), repeats)
 
 
-def _parallel_worker(model_path, ps, max_tokens, out_q):
-    mx.reset_peak_memory()
-    model, tokenizer = load(model_path)
-    ids = [tokenizer.encode(p) for p in ps]
-    gen_batch(model, tokenizer, [ids[0]], max_tokens)  # per-shape warmup, discarded
-    mx.reset_peak_memory()
-    t0 = time.perf_counter()
-    total, ttfts = 0, []
-    for t in ids:
-        tok, ttft = gen_batch(model, tokenizer, [t], max_tokens)
-        total += tok
-        ttfts.append(ttft)
-    out_q.put({"gen_s": time.perf_counter() - t0, "tokens": total,
-               "ttft_ms": ttfts[0] * 1000, "peak_gb": mx.get_peak_memory() / 1e9})
-
-
-def _parallel_once(model_path: str, n: int, workers: int, max_tokens: int) -> dict:
-    chunks = [make_prompts(n)[i::workers] for i in range(workers)]
-    out_q: mp.Queue = mp.Queue()
-    procs = [mp.Process(target=_parallel_worker, args=(model_path, chunks[w], max_tokens, out_q))
-             for w in range(workers)]
-    for p in procs:
-        p.start()
-    res = [out_q.get() for _ in range(workers)]  # drain before join (avoid pipe-buffer deadlock)
-    for p in procs:
-        p.join()
-    gen_s = max(r["gen_s"] for r in res)  # load excluded, matching other modes
-    return {"throughput": sum(r["tokens"] for r in res) / gen_s,
-            "ttft_ms": max(r["ttft_ms"] for r in res),
-            "peak_gb": sum(r["peak_gb"] for r in res)}  # aggregate across processes
+def _parallel_worker(model_path, ps, max_tokens, repeats, out_q):
+    """Load the model once, then run `repeats` measured passes (load excluded).
+    Returns a list of per-repeat samples, or an {'error': ...} dict on failure."""
+    try:
+        model, tokenizer = load(model_path)
+        ids = [tokenizer.encode(p) for p in ps]
+        gen_batch(model, tokenizer, [ids[0]], max_tokens)  # per-shape warmup, discarded
+        samples = []
+        for _ in range(repeats):
+            mx.reset_peak_memory()
+            t0 = time.perf_counter()
+            total, ttfts = 0, []
+            for t in ids:
+                tok, ttft = gen_batch(model, tokenizer, [t], max_tokens)
+                total += tok
+                ttfts.append(ttft)
+            samples.append({"gen_s": time.perf_counter() - t0, "tokens": total,
+                            "ttft_ms": ttfts[0] * 1000, "peak_gb": mx.get_peak_memory() / 1e9})
+        out_q.put(samples)
+    except Exception as e:  # OOM, load failure, etc. — report instead of hanging the parent
+        out_q.put({"error": repr(e)})
 
 
 def bench_parallel(model_path: str, n: int, workers: int, max_tokens: int, repeats: int) -> dict:
-    s = [_parallel_once(model_path, n, workers, max_tokens) for _ in range(repeats)]
-    return {"mode": "parallel", "param": workers,
-            "throughput": median([r["throughput"] for r in s]),
-            "ttft_ms": median([r["ttft_ms"] for r in s]),
-            "peak_gb": median([r["peak_gb"] for r in s]), "repeats": repeats}
+    # Drop empty chunks (workers > prompts) so no worker exits without producing output.
+    chunks = [c for i in range(workers) if (c := make_prompts(n)[i::workers])]
+    out_q: mp.Queue = mp.Queue()
+    procs = [mp.Process(target=_parallel_worker, args=(model_path, c, max_tokens, repeats, out_q))
+             for c in chunks]
+    for p in procs:
+        p.start()
+
+    collected = []
+    while len(collected) < len(procs):
+        try:
+            collected.append(out_q.get(timeout=1.0))
+        except queue.Empty:
+            if any(p.exitcode not in (None, 0) for p in procs):  # a worker died (likely OOM)
+                for p in procs:
+                    p.terminate()
+                raise RuntimeError("a parallel worker exited unexpectedly (likely OOM)")
+    for p in procs:
+        p.join()
+
+    errors = [c for c in collected if isinstance(c, dict)]
+    if errors:
+        raise RuntimeError(f"parallel worker failed: {errors[0]['error']}")
+
+    # collected: per-worker list of per-repeat samples. Aggregate across workers per repeat.
+    tps, ttfts, peaks = [], [], []
+    for r in range(repeats):
+        per = [worker[r] for worker in collected]
+        gen_s = max(s["gen_s"] for s in per)  # load excluded, matching other modes
+        tps.append(sum(s["tokens"] for s in per) / gen_s)
+        ttfts.append(max(s["ttft_ms"] for s in per))
+        peaks.append(sum(s["peak_gb"] for s in per))  # aggregate memory across processes
+    return {"mode": "parallel", "param": workers, "throughput": median(tps),
+            "ttft_ms": median(ttfts), "peak_gb": median(peaks), "repeats": repeats}
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +262,8 @@ def main():
     gc.collect()
     mx.clear_cache()
 
-    ram_budget = get_ram_gb() - 6  # leave headroom for OS
+    ram = get_ram_gb()
+    ram_budget = ram - 6 if ram > 0 else float("inf")  # unknown RAM (non-mac) → don't gate
     for nw in args.worker_counts:
         if single_peak and nw * single_peak > ram_budget:
             print(f"  SKIP parallel x{nw}: ~{nw * single_peak:.1f}GB > {ram_budget:.0f}GB budget")
