@@ -1,13 +1,27 @@
 #!/usr/bin/env python3
-"""Benchmark: parallel model instances vs batched inference on MLX.
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["mlx", "mlx-lm"]
+# ///
+# pyright: reportMissingImports=false
+"""Benchmark: sequential vs batched vs parallel LLM inference on MLX.
 
-Compares PURE GENERATION throughput (excludes model loading time).
+Measures the three axes a serving system actually trades off:
 
-  A) Sequential: generate() one prompt at a time (baseline, uses KV cache)
-  B) Parallel: N model instances, each handles 1/N prompts via generate()
-  C) Batched: manually batches prompt KV prefill, then generates in batch
+  - throughput  (tok/s, aggregate)
+  - latency     (TTFT = time-to-first-token, ms)
+  - memory      (peak MLX allocation, GB)
 
-For B & C, only pure generation wall time is measured (load excluded).
+Strategies, all using the SAME greedy (argmax) decode so the comparison is
+apples-to-apples:
+
+  A) Sequential : one prompt at a time, fresh KV cache each (latency-optimal)
+  B) Batched    : N prompts share one forward pass per step (throughput-optimal)
+  C) Parallel   : N processes, each its own model copy (memory-bound)
+
+Model load time is excluded from every measurement.
+
+Run:  uv run bench.py --model mlx-community/Qwen3-0.6B-4bit
 """
 
 import argparse
@@ -15,22 +29,14 @@ import gc
 import json
 import multiprocessing as mp
 import os
+import queue
 import subprocess
 import time
 from pathlib import Path
 
 import mlx.core as mx
-
-
-def get_ram_gb():
-    try:
-        r = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True
-        )
-        return int(r.stdout.strip()) / (1024**3)
-    except Exception:
-        return 0
-
+from mlx_lm import load
+from mlx_lm.models.cache import make_prompt_cache
 
 MEDIUM_PROMPT = (
     "Write a comprehensive analysis of the impact of artificial intelligence "
@@ -39,343 +45,241 @@ MEDIUM_PROMPT = (
 )
 
 
-def make_prompts(n: int, text: str = MEDIUM_PROMPT):
+def get_ram_gb() -> float:
+    try:
+        r = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.memsize"],
+                           capture_output=True, text=True, check=True)
+        return int(r.stdout.strip()) / (1024**3)
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return 0.0  # non-macOS or sysctl missing; caller treats 0 as "unknown"
+
+
+def make_prompts(n: int, text: str = MEDIUM_PROMPT) -> list[str]:
     return [text] * n
 
 
 # ---------------------------------------------------------------------------
-# Helper: batched prefill + KV-cache-aware generation using MLX low-level API
+# Core decode primitive: one greedy batch with KV cache.
+# Returns (tokens_generated, ttft_seconds). cache is mutated in place by model().
 # ---------------------------------------------------------------------------
-def batch_generate(model, tokenizer, prompts: list[str], max_tokens: int):
-    """Batched generation with KV cache.
-
-    Steps:
-      1. Prefill: run all prompts through model once (populates KV cache)
-      2. Generate: sample one token per batch element per step (append to KV cache)
-    """
+def gen_batch(model, tokenizer, ids: list[list[int]], max_tokens: int) -> tuple[int, float]:
     eos_id = tokenizer.eos_token_id
-    if eos_id is None:
+    if eos_id is None and getattr(tokenizer, "eos_token", None) is not None:
         eos_id = tokenizer.convert_tokens_to_ids(tokenizer.eos_token)
+    B = len(ids)
+    # ponytail: prompts are duplicated (all equal length), so no attention mask
+    # is needed for the batched prefill. Differing lengths would need left-pad +
+    # masking (mlx_lm BatchKVCache) — out of scope for this throughput study.
+    L = len(ids[0])
+    assert all(len(t) == L for t in ids), "batched path requires equal-length prompts"
 
-    # Tokenize
-    all_ids = [tokenizer.encode(p) for p in prompts]
-    max_len = max(len(t) for t in all_ids)
-    B = len(prompts)
+    x = mx.array(ids)  # (B, L)
+    cache = make_prompt_cache(model)
 
-    # Left-pad to max_len
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
-    padded = [([pad_id] * (max_len - len(t))) + t for t in all_ids]
-    x = mx.array(padded)  # (B, max_len)
+    t0 = time.perf_counter()
+    logits = model(x, cache=cache)            # prefill, populates cache
+    next_tok = mx.argmax(logits[:, -1, :], axis=-1)
+    mx.eval(next_tok)                          # force compute: honest TTFT (MLX is lazy)
+    ttft = time.perf_counter() - t0
 
-    # KV caches per batch element
-    state = [None for _ in range(B)]
-
-    # Prefill: run full prompt through model to populate KV caches
-    for i in range(B):
-        # Extract just the actual tokens (not padding)
-        actual_len = len(all_ids[i])
-        prompt_tokens = padded[i][
-            -actual_len:
-        ]  # last actual_len tokens are the real ones
-
-        # Run each prompt individually through the model to populate KV cache
-        px = mx.array([prompt_tokens])
-        logits, cache = model(px, cache=state[i])
-        state[i] = cache
-        # logits shape: (1, actual_len, vocab_size)
-
-    # Now generate in batch
-    # After prefill, next position is at index max_len in the full padded sequence
-    # But since we only used actual tokens, we need to track position
-
-    # Simple approach: use generate() for individual, no true batch
-    # Instead, let me do batched prefill and then individual generation
-    # This at least measures the prefill batching benefit
-
-    # Alternative simpler approach:
-    # 1. All prompts are the same length (they are, since we duplicated MEDIUM_PROMPT)
-    # 2. We can create a true batch for ALL tokens
-    # 3. Prefill all B prompts in one forward pass
-    # 4. Then generate one token at a time for the entire batch
-
-    # Since all prompts have the same length (we duplicated), we can batch the prefill
-    x = mx.array(all_ids)  # (B, prompt_len) - no padding needed since all same length
-
-    # Prefill: one forward pass for all prompts
-    logits, cache = model(x, cache=None)
-    # cache is the KV cache for all B elements
-    # For the next step, we need to create new tokens
-
-    generated = [[] for _ in range(B)]
     finished = [False] * B
-    total_tokens = 0
-
+    total = 0
     for step in range(max_tokens):
-        # Get logits for last position of each batch element
-        next_logits = logits[:, -1, :]
-        next_tokens = mx.argmax(next_logits, axis=-1).reshape(-1).tolist()
-
-        any_active = False
-        new_tokens = []
+        toks = next_tok.tolist()
+        active = False
         for i in range(B):
             if finished[i]:
-                new_tokens.append(pad_id)
+                continue
+            if toks[i] == eos_id:
+                finished[i] = True
             else:
-                tok = next_tokens[i]
-                if tok == eos_id:
-                    finished[i] = True
-                    new_tokens.append(pad_id)
-                else:
-                    any_active = True
-                    generated[i].append(tok)
-                    total_tokens += 1
-                    new_tokens.append(tok)
+                total += 1
+                active = True
+        if not active or step == max_tokens - 1:
+            break  # last token counted; don't decode an extra unused one (skews timing)
+        logits = model(next_tok.reshape(B, 1), cache=cache)
+        next_tok = mx.argmax(logits[:, -1, :], axis=-1)
+        mx.eval(next_tok)
+    return total, ttft
 
-        if not any_active:
-            break
 
-        nt = mx.array([new_tokens]).reshape(B, 1)
-        logits, cache = model(nt, cache=cache)
-
-    texts = [tokenizer.decode(g) for g in generated]
-    return texts, total_tokens
+def measure(fn):
+    """Run fn under peak-memory + wall-clock instrumentation.
+    Returns (result, wall_s, peak_gb)."""
+    gc.collect()
+    mx.clear_cache()
+    mx.reset_peak_memory()
+    t0 = time.perf_counter()
+    result = fn()
+    wall = time.perf_counter() - t0
+    return result, wall, mx.get_peak_memory() / 1e9
 
 
 # ---------------------------------------------------------------------------
-# Benchmarks (all measured WITHOUT model loading time)
+# Strategies
 # ---------------------------------------------------------------------------
-
-
 class ModelHandle:
-    """Keep model loaded across benchmark runs."""
-
-    def __init__(self, path):
-        from mlx_lm import load
-
+    def __init__(self, path: str):
         self.model, self.tokenizer = load(path)
 
-    def sequential(self, prompts: list[str], max_tokens: int):
-        from mlx_lm import generate
+    def _encode(self, prompts: list[str]) -> list[list[int]]:
+        return [self.tokenizer.encode(p) for p in prompts]
 
-        total_tokens = 0
-        for p in prompts:
-            resp = generate(
-                self.model,
-                self.tokenizer,
-                prompt=p,
-                max_tokens=max_tokens,
-                verbose=False,
-            )
-            total_tokens += len(self.tokenizer.encode(resp))
-        return total_tokens
+    def sequential(self, prompts: list[str], max_tokens: int) -> tuple[int, float]:
+        ids = self._encode(prompts)
+        total, ttfts = 0, []
+        for t in ids:
+            tok, ttft = gen_batch(self.model, self.tokenizer, [t], max_tokens)
+            total += tok
+            ttfts.append(ttft)
+        return total, ttfts[0]
 
-    def batched(self, prompts: list[str], max_tokens: int):
-        _, total_tokens = batch_generate(
-            self.model, self.tokenizer, prompts, max_tokens
-        )
-        return total_tokens
-
-
-def bench_sequential(handle: ModelHandle, num_prompts: int, max_tokens: int):
-    prompts = make_prompts(num_prompts)
-    t0 = time.perf_counter()
-    total_tokens = handle.sequential(prompts, max_tokens)
-    elapsed = time.perf_counter() - t0
-    return {
-        "total_tokens": total_tokens,
-        "gen_s": elapsed,
-        "throughput": total_tokens / elapsed,
-    }
+    def batched(self, prompts: list[str], bs: int, max_tokens: int) -> tuple[int, float]:
+        ids = self._encode(prompts)
+        total, ttfts = 0, []
+        for i in range(0, len(ids), bs):
+            tok, ttft = gen_batch(self.model, self.tokenizer, ids[i : i + bs], max_tokens)
+            total += tok
+            ttfts.append(ttft)
+        return total, ttfts[0]
 
 
-def bench_batched(
-    handle: ModelHandle, num_prompts: int, batch_size: int, max_tokens: int
-):
-    prompts = make_prompts(num_prompts)
-    t0 = time.perf_counter()
-    total_tokens = 0
-    for i in range(0, num_prompts, batch_size):
-        chunk = prompts[i : i + batch_size]
-        _, tok = batch_generate(handle.model, handle.tokenizer, chunk, max_tokens)
-        total_tokens += tok
-    elapsed = time.perf_counter() - t0
-    return {
-        "total_tokens": total_tokens,
-        "gen_s": elapsed,
-        "throughput": total_tokens / elapsed,
-        "batch_size": batch_size,
-    }
+def median(xs: list[float]) -> float:
+    xs = sorted(xs)
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
 
 
-def bench_parallel(
-    model_path: str, num_prompts: int, num_workers: int, max_tokens: int
-):
-    """Each worker loads its own model, then generates on its subset.
-    Times reported: load (per worker max), gen (per worker max), wall.
-    """
-    prompts = make_prompts(num_prompts)
-    chunks = [prompts[i::num_workers] for i in range(num_workers)]
+def run_inproc(label: str, param: int, fn, repeats: int) -> dict:
+    """Run fn (-> (tokens, ttft_s)) repeats+1 times; discard the first as a
+    per-shape warmup (MLX JIT-compiles per tensor shape), report medians."""
+    tps, ttfts, peaks = [], [], []
+    for j in range(repeats + 1):
+        (total, ttft), wall, peak = measure(fn)
+        if j == 0:
+            continue
+        tps.append(total / wall)
+        ttfts.append(ttft * 1000)
+        peaks.append(peak)
+    return {"mode": label, "param": param, "throughput": median(tps),
+            "ttft_ms": median(ttfts), "peak_gb": median(peaks), "repeats": repeats}
 
-    def _worker(ps, out_q):
-        from mlx_lm import load, generate
 
-        t0 = time.perf_counter()
+def bench_sequential(handle: ModelHandle, n: int, max_tokens: int, repeats: int) -> dict:
+    return run_inproc("sequential", 1, lambda: handle.sequential(make_prompts(n), max_tokens), repeats)
+
+
+def bench_batched(handle: ModelHandle, n: int, bs: int, max_tokens: int, repeats: int) -> dict:
+    return run_inproc("batched", bs, lambda: handle.batched(make_prompts(n), bs, max_tokens), repeats)
+
+
+def _parallel_worker(model_path, ps, max_tokens, repeats, out_q):
+    """Load the model once, then run `repeats` measured passes (load excluded).
+    Returns a list of per-repeat samples, or an {'error': ...} dict on failure."""
+    try:
         model, tokenizer = load(model_path)
-        load_s = time.perf_counter() - t0
-        t_gen = time.perf_counter()
-        total_tok = 0
-        for p in ps:
-            resp = generate(
-                model, tokenizer, prompt=p, max_tokens=max_tokens, verbose=False
-            )
-            total_tok += len(tokenizer.encode(resp))
-        gen_s = time.perf_counter() - t_gen
-        out_q.put({"load_s": load_s, "gen_s": gen_s, "tokens": total_tok})
+        ids = [tokenizer.encode(p) for p in ps]
+        gen_batch(model, tokenizer, [ids[0]], max_tokens)  # per-shape warmup, discarded
+        samples = []
+        for _ in range(repeats):
+            mx.reset_peak_memory()
+            t0 = time.perf_counter()
+            total, ttfts = 0, []
+            for t in ids:
+                tok, ttft = gen_batch(model, tokenizer, [t], max_tokens)
+                total += tok
+                ttfts.append(ttft)
+            samples.append({"gen_s": time.perf_counter() - t0, "tokens": total,
+                            "ttft_ms": ttfts[0] * 1000, "peak_gb": mx.get_peak_memory() / 1e9})
+        out_q.put(samples)
+    except Exception as e:  # OOM, load failure, etc. — report instead of hanging the parent
+        out_q.put({"error": repr(e)})
 
-    out_q = mp.Queue()
-    procs = [
-        mp.Process(target=_worker, args=(chunks[w], out_q)) for w in range(num_workers)
-    ]
-    t0 = time.perf_counter()
+
+def bench_parallel(model_path: str, n: int, workers: int, max_tokens: int, repeats: int) -> dict:
+    # Drop empty chunks (workers > prompts) so no worker exits without producing output.
+    chunks = [c for i in range(workers) if (c := make_prompts(n)[i::workers])]
+    out_q: mp.Queue = mp.Queue()
+    procs = [mp.Process(target=_parallel_worker, args=(model_path, c, max_tokens, repeats, out_q))
+             for c in chunks]
     for p in procs:
         p.start()
+
+    collected = []
+    while len(collected) < len(procs):
+        try:
+            collected.append(out_q.get(timeout=1.0))
+        except queue.Empty:
+            if any(p.exitcode not in (None, 0) for p in procs):  # a worker died (likely OOM)
+                for p in procs:
+                    p.terminate()
+                raise RuntimeError("a parallel worker exited unexpectedly (likely OOM)")
     for p in procs:
         p.join()
-    wall_s = time.perf_counter() - t0
 
-    results = [out_q.get() for _ in range(num_workers)]
-    total_tokens = sum(r["tokens"] for r in results)
-    max_gen = max(r["gen_s"] for r in results)
-    max_load = max(r["load_s"] for r in results)
+    errors = [c for c in collected if isinstance(c, dict)]
+    if errors:
+        raise RuntimeError(f"parallel worker failed: {errors[0]['error']}")
 
-    return {
-        "mode": "parallel",
-        "num_prompts": num_prompts,
-        "num_workers": num_workers,
-        "wall_s": wall_s,
-        "load_s": max_load,
-        "gen_s": max_gen,
-        "total_tokens": total_tokens,
-        "throughput_wall": total_tokens / wall_s,
-        "throughput_pure_gen": total_tokens / (max_gen * num_workers),
-    }
+    # collected: per-worker list of per-repeat samples. Aggregate across workers per repeat.
+    tps, ttfts, peaks = [], [], []
+    for r in range(repeats):
+        per = [worker[r] for worker in collected]
+        gen_s = max(s["gen_s"] for s in per)  # load excluded, matching other modes
+        tps.append(sum(s["tokens"] for s in per) / gen_s)
+        ttfts.append(max(s["ttft_ms"] for s in per))
+        peaks.append(sum(s["peak_gb"] for s in per))  # aggregate memory across processes
+    return {"mode": "parallel", "param": workers, "throughput": median(tps),
+            "ttft_ms": median(ttfts), "peak_gb": median(peaks), "repeats": repeats}
 
 
 # ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model",
-        default=str(
-            Path.home() / ".lmstudio/models/unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit"
-        ),
-    )
-    parser.add_argument("--num-prompts", type=int, default=8)
-    parser.add_argument("--max-tokens", type=int, default=64)
-    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[2, 4, 8])
-    parser.add_argument("--worker-counts", type=int, nargs="+", default=[1, 2])
-    parser.add_argument("--output", default=None)
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="mlx-community/Qwen3-0.6B-4bit")
+    ap.add_argument("--num-prompts", type=int, default=8)
+    ap.add_argument("--max-tokens", type=int, default=64)
+    ap.add_argument("--batch-sizes", type=int, nargs="+", default=[2, 4, 8])
+    ap.add_argument("--worker-counts", type=int, nargs="+", default=[1, 2])
+    ap.add_argument("--repeats", type=int, default=3, help="measured runs per config (median reported)")
+    ap.add_argument("--output", default=None)
+    args = ap.parse_args()
 
-    ram = get_ram_gb()
-    model_size_gb = 20
-    print(f"RAM: {ram:.0f} GB  CPUs: {os.cpu_count()}")
-    print(f"Model: {Path(args.model).name}")
-    print(f"All prompts: {args.num_prompts} x {args.max_tokens} tokens each")
-    print()
+    print(f"RAM: {get_ram_gb():.0f} GB  CPUs: {os.cpu_count()}  model: {Path(args.model).name}")
+    print(f"workload: {args.num_prompts} prompts x {args.max_tokens} tokens, greedy decode, "
+          f"median of {args.repeats} (per-shape warmup discarded)\n")
 
-    results = []
-
-    # --- Sequential baseline ---
-    print("=" * 55)
-    print("PHASE 1: Loading model (shared across sequential + batched)")
-    print("=" * 55)
-    t0 = time.perf_counter()
     handle = ModelHandle(args.model)
-    print(f"  Load: {time.perf_counter() - t0:.1f}s")
-    gc.collect()
+    results = [bench_sequential(handle, args.num_prompts, args.max_tokens, args.repeats)]
+    single_peak = results[0]["peak_gb"]
 
-    print("\n" + "-" * 55)
-    print("Sequential (baseline, generate() 1 prompt at a time)")
-    print("-" * 55)
-    r = bench_sequential(handle, args.num_prompts, args.max_tokens)
-    results.append({"mode": "sequential", "num_prompts": args.num_prompts, **r})
-    print(
-        f"  {r['gen_s']:.2f}s  {r['throughput']:.1f} tok/s  {r['gen_s'] / args.num_prompts * 1000:.0f} ms/prompt"
-    )
-
-    # --- Batched ---
-    print("\n" + "-" * 55)
-    print("Batched (single model, varying batch size)")
-    print("-" * 55)
     for bs in args.batch_sizes:
         if bs > args.num_prompts:
             continue
-        r = bench_batched(handle, args.num_prompts, bs, args.max_tokens)
-        r["mode"] = "batched"
-        results.append(r)
-        print(
-            f"  batch_size={bs:2d}: {r['gen_s']:.2f}s  {r['throughput']:.1f} tok/s  {r['gen_s'] / args.num_prompts * 1000:.0f} ms/prompt"
-        )
+        results.append(bench_batched(handle, args.num_prompts, bs, args.max_tokens, args.repeats))
 
     del handle
     gc.collect()
+    mx.clear_cache()
 
-    # --- Parallel ---
-    print("\n" + "-" * 55)
-    print("Parallel (multi-process, each loads own model instance)")
-    print("-" * 55)
+    ram = get_ram_gb()
+    ram_budget = ram - 6 if ram > 0 else float("inf")  # unknown RAM (non-mac) → don't gate
     for nw in args.worker_counts:
-        needed = nw * model_size_gb
-        available = ram - 10
-        if needed > available:
-            print(f"  SKIP {nw} workers: need ~{needed}GB, ~{available:.0f}GB free")
+        if single_peak and nw * single_peak > ram_budget:
+            print(f"  SKIP parallel x{nw}: ~{nw * single_peak:.1f}GB > {ram_budget:.0f}GB budget")
             continue
-        r = bench_parallel(args.model, args.num_prompts, nw, args.max_tokens)
-        results.append(r)
-        print(
-            f"  workers={nw}: wall={r['wall_s']:.2f}s load={r['load_s']:.1f}s gen={r['gen_s']:.2f}s"
-        )
-        print(f"    throughput (wall):  {r['throughput_wall']:.1f} tok/s")
-        print(f"    throughput (pure gen): {r['throughput_pure_gen']:.1f} tok/s")
+        results.append(bench_parallel(args.model, args.num_prompts, nw, args.max_tokens, args.repeats))
 
-    # --- Comparison ---
-    print("\n" + "=" * 65)
-    print(f"{'Mode':<14} {'Param':<8} {'Tok/s':<10} {'Speedup':<10} {'Lat/p':<10}")
-    print("-" * 65)
-    seq_tp = next(r for r in results if r["mode"] == "sequential")["throughput"]
+    seq_tp = next(r["throughput"] for r in results if r["mode"] == "sequential")
+    print(f"\n{'Mode':<12}{'Param':<7}{'Tok/s':<9}{'Speedup':<9}{'TTFT ms':<9}{'Peak GB':<8}")
+    print("-" * 54)
     for r in results:
-        if r["mode"] == "sequential":
-            param = 1
-            tp = r["throughput"]
-            lat = r["gen_s"] / args.num_prompts * 1000
-            print(
-                f"{'sequential':<14} {param:<8} {tp:<10.1f} {'1.00x':<10} {lat:<10.0f}ms"
-            )
-        elif r["mode"] == "batched":
-            tp = r["throughput"]
-            lat = r["gen_s"] / args.num_prompts * 1000
-            print(
-                f"{'batched':<14} {r['batch_size']:<8} {tp:<10.1f} {tp / seq_tp:<10.2f}x {lat:<10.0f}ms"
-            )
-        elif r["mode"] == "parallel":
-            tp = r["throughput_wall"]
-            lat = r["wall_s"] / args.num_prompts * 1000
-            print(
-                f"{'parallel':<14} {r['num_workers']:<8} {tp:<10.1f} {tp / seq_tp:<10.2f}x {lat:<10.0f}ms"
-            )
-            tp_pure = r["throughput_pure_gen"]
-            print(
-                f"{'parallel(pure)':<14} {r['num_workers']:<8} {tp_pure:<10.1f} {tp_pure / seq_tp:<10.2f}x {'':<10}"
-            )
+        print(f"{r['mode']:<12}{r['param']:<7}{r['throughput']:<9.1f}"
+              f"{r['throughput'] / seq_tp:<9.2f}{r['ttft_ms']:<9.0f}{r['peak_gb']:<8.2f}")
 
     if args.output:
-        with open(args.output, "w") as f:
-            json.dump(results, f, indent=2)
+        Path(args.output).write_text(json.dumps(results, indent=2))
+        print(f"\nwrote {args.output}")
 
 
 if __name__ == "__main__":
