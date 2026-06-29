@@ -150,6 +150,19 @@ def median(xs: list[float]) -> float:
     return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
 
 
+def write_results(results: list[dict], output: str, base: str = ".") -> Path:
+    """Write results JSON to `output` (a bare filename) inside `base` (cwd).
+
+    Rejects any path with directory components to prevent path traversal (S8707).
+    """
+    name = os.path.basename(output)
+    if not name or name != output:
+        raise ValueError(f"--output must be a bare filename (no directories): {output!r}")
+    path = Path(os.path.realpath(base)) / name
+    path.write_text(json.dumps(results, indent=2))
+    return path
+
+
 def run_inproc(label: str, param: int, fn, repeats: int) -> dict:
     """Run fn (-> (tokens, ttft_s)) repeats+1 times; discard the first as a
     per-shape warmup (MLX JIT-compiles per tensor shape), report medians."""
@@ -278,8 +291,8 @@ def main():
               f"{r['throughput'] / seq_tp:<9.2f}{r['ttft_ms']:<9.0f}{r['peak_gb']:<8.2f}")
 
     if args.output:
-        Path(args.output).write_text(json.dumps(results, indent=2))
-        print(f"\nwrote {args.output}")
+        out = write_results(results, args.output)
+        print(f"\nwrote {out}")
 
 
 if __name__ == "__main__":
